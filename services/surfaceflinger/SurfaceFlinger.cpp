@@ -814,13 +814,6 @@ void SurfaceFlinger::bootFinished()
     if (mWindowManager != 0) {
         mWindowManager->linkToDeath(static_cast<IBinder::DeathRecipient*>(this));
     }
-    sp<IBinder> input(defaultServiceManager()->getService(
-            String16("inputflinger")));
-    if (input == nullptr) {
-        ALOGE("Failed to link to input service");
-    } else {
-        mInputFlinger = interface_cast<IInputFlinger>(input);
-    }
 
     if (mVrFlinger) {
       mVrFlinger->OnBootFinished();
@@ -835,7 +828,15 @@ void SurfaceFlinger::bootFinished()
     LOG_EVENT_LONG(LOGTAG_SF_STOP_BOOTANIM,
                    ns2ms(systemTime(SYSTEM_TIME_MONOTONIC)));
 
-    static_cast<void>(schedule([this] {
+    sp<IBinder> input(defaultServiceManager()->getService(String16("inputflinger")));
+
+    static_cast<void>(schedule([=] {
+        if (input == nullptr) {
+            ALOGE("Failed to link to input service");
+        } else {
+            mInputFlinger = interface_cast<IInputFlinger>(input);
+        }
+
         readPersistentProperties();
         mPowerAdvisor.onBootFinished();
         mBootStage = BootStage::FINISHED;
@@ -1896,7 +1897,7 @@ void SurfaceFlinger::signalRefresh() {
     mEventQueue->refresh();
 }
 
-nsecs_t SurfaceFlinger::getVsyncPeriod() const {
+nsecs_t SurfaceFlinger::getVsyncPeriodFromHWC() const {
     auto displayId = getInternalDisplayIdLocked();
     if (mNextVsyncSource) {
         displayId = mNextVsyncSource->getId();
@@ -2047,7 +2048,7 @@ void SurfaceFlinger::onRefreshReceived(int sequenceId, hal::HWDisplayId /*hwcDis
         // Track Vsync Period before and after refresh.
         std::lock_guard lock(mVsyncPeriodMutex);
         mVsyncPeriods = {};
-        mVsyncPeriods.push_back(getVsyncPeriod());
+        mVsyncPeriods.push_back(getVsyncPeriodFromHWC());
     }
 }
 
@@ -2157,7 +2158,7 @@ void SurfaceFlinger::updateVrFlinger() {
     setPowerModeInternal(display, currentDisplayPowerMode);
 
     // Reset the timing values to account for the period of the swapped in HWC
-    const nsecs_t vsyncPeriod = getVsyncPeriod();
+    const nsecs_t vsyncPeriod = mRefreshRateConfigs->getCurrentRefreshRate().getVsyncPeriod();
     mAnimFrameTracker.setDisplayRefreshPeriod(vsyncPeriod);
 
     // The present fences returned from vr_hwc are not an accurate
@@ -2233,7 +2234,7 @@ void SurfaceFlinger::updateFrameScheduler() NO_THREAD_SAFETY_ANALYSIS {
         return;
     }
 
-    const nsecs_t period = getVsyncPeriod();
+    const nsecs_t period = getVsyncPeriodFromHWC();
     mScheduler->resyncToHardwareVsync(true, period, true /* force resync */);
     if (timeStamp > 0) {
         bool periodFlushed = false;
@@ -2595,7 +2596,8 @@ void SurfaceFlinger::onMessageRefresh() {
         mTimeStats->incrementCompositionStrategyChanges();
     }
 
-    mVSyncModulator->onRefreshed(mHadClientComposition);
+    // TODO: b/160583065 Enable skip validation when SF caches all client composition layers
+    mVSyncModulator->onRefreshed(mHadClientComposition || mReusedClientComposition);
 
     mLayersWithQueuedFrames.clear();
     if (mVisibleRegionsDirty) {
@@ -2898,7 +2900,7 @@ void SurfaceFlinger::forceResyncModel() NO_THREAD_SAFETY_ANALYSIS {
         return;
     }
 
-    const nsecs_t period = getVsyncPeriod();
+    const nsecs_t period = getVsyncPeriodFromHWC();
     // Model resync should happen at every fps change.
     // Upon increase/decrease in vsync period start resync immediately.
     // Initial set of vsync wakeups happen at ref_time + N * period where N = 1, 2, 3 ..
@@ -2987,13 +2989,13 @@ void SurfaceFlinger::updateVsyncSource()
     } else if (mNextVsyncSource && (mActiveVsyncSource == NULL)) {
         mScheduler->onScreenAcquired(mAppConnectionHandle);
         bool isPrimary = mNextVsyncSource->isPrimary();
-        nsecs_t vsync = (isPrimary && (mVsyncPeriod > 0)) ? mVsyncPeriod : getVsyncPeriod();
+        nsecs_t vsync = (isPrimary && (mVsyncPeriod > 0)) ? mVsyncPeriod : getVsyncPeriodFromHWC();
         mScheduler->resyncToHardwareVsync(true, vsync);
     } else if ((mNextVsyncSource != NULL) &&
         (mActiveVsyncSource != NULL)) {
         // Switch vsync to the new source
         mScheduler->disableHardwareVsync(true);
-        mScheduler->resyncToHardwareVsync(true, getVsyncPeriod());
+        mScheduler->resyncToHardwareVsync(true, getVsyncPeriodFromHWC());
     }
 }
 
@@ -4966,8 +4968,7 @@ void SurfaceFlinger::onInitializeDisplays() {
                         {});
 
     setPowerModeInternal(display, hal::PowerMode::ON);
-
-    const nsecs_t vsyncPeriod = getVsyncPeriod();
+    const nsecs_t vsyncPeriod = mRefreshRateConfigs->getCurrentRefreshRate().getVsyncPeriod();
     mAnimFrameTracker.setDisplayRefreshPeriod(vsyncPeriod);
 
     // Use phase of 0 since phase is not known.
@@ -5009,7 +5010,7 @@ void SurfaceFlinger::setPowerModeInternal(const sp<DisplayDevice>& display, hal:
     if (mInterceptor->isEnabled()) {
         mInterceptor->savePowerModeUpdate(display->getSequenceId(), static_cast<int32_t>(mode));
     }
-
+    const auto vsyncPeriod = mRefreshRateConfigs->getCurrentRefreshRate().getVsyncPeriod();
     if (currentMode == hal::PowerMode::OFF) {
         if (SurfaceFlinger::setSchedFifo(true) != NO_ERROR) {
             ALOGW("Couldn't set SCHED_FIFO on display on: %s\n", strerror(errno));
@@ -5019,7 +5020,7 @@ void SurfaceFlinger::setPowerModeInternal(const sp<DisplayDevice>& display, hal:
             if (display->isPrimary() && mode != hal::PowerMode::DOZE_SUSPEND) {
                 getHwComposer().setVsyncEnabled(*displayId, mHWCVsyncPendingState);
                 mScheduler->onScreenAcquired(mAppConnectionHandle);
-                mScheduler->resyncToHardwareVsync(true, getVsyncPeriod());
+                mScheduler->resyncToHardwareVsync(true, vsyncPeriod);
             }
         } else if ((mPluggableVsyncPrioritized && (displayId != getInternalDisplayIdLocked())) ||
                     displayId == getInternalDisplayIdLocked()) {
@@ -5054,7 +5055,7 @@ void SurfaceFlinger::setPowerModeInternal(const sp<DisplayDevice>& display, hal:
         if (isDummyDisplay) {
             if (display->isPrimary() && currentMode == hal::PowerMode::DOZE_SUSPEND) {
                 mScheduler->onScreenAcquired(mAppConnectionHandle);
-                mScheduler->resyncToHardwareVsync(true, getVsyncPeriod());
+                mScheduler->resyncToHardwareVsync(true, vsyncPeriod);
             }
         } else {
             updateVsyncSource();
@@ -5392,7 +5393,7 @@ void SurfaceFlinger::listLayersLocked(std::string& result) const {
 }
 
 void SurfaceFlinger::dumpStatsLocked(const DumpArgs& args, std::string& result) const {
-    StringAppendF(&result, "%" PRId64 "\n", getVsyncPeriod());
+    StringAppendF(&result, "%" PRId64 "\n", getVsyncPeriodFromHWC());
 
     if (args.size() > 1) {
         const auto name = String8(args[1]);
@@ -5457,7 +5458,7 @@ void SurfaceFlinger::dumpVSync(std::string& result) const {
     mPhaseConfiguration->dump(result);
     StringAppendF(&result,
                   "      present offset: %9" PRId64 " ns\t     VSYNC period: %9" PRId64 " ns\n\n",
-                  dispSyncPresentTimeOffset, getVsyncPeriod());
+                  dispSyncPresentTimeOffset, getVsyncPeriodFromHWC());
 
     scheduler::RefreshRateConfigs::Policy policy = mRefreshRateConfigs->getDisplayManagerPolicy();
     StringAppendF(&result,
@@ -6037,9 +6038,9 @@ status_t SurfaceFlinger::CheckTransactCodeCredentials(uint32_t code) {
         code == IBinder::SYSPROPS_TRANSACTION) {
         return OK;
     }
-    // Numbers from 1000 to 1036 and 20000 are currently used for backdoors. The code
+    // Numbers from 1000 to 1036 and 20000 to 20002 are currently used for backdoors. The code
     // in onTransact verifies that the user is root, and has access to use SF.
-    if ((code >= 1000 && code <= 1036) || (code == 20000)) {
+    if ((code >= 1000 && code <= 1036) || (code >= 20000 && code <= 20002)) {
         ALOGV("Accessing SurfaceFlinger through backdoor code: %u", code);
         return OK;
     }
@@ -6385,11 +6386,161 @@ status_t SurfaceFlinger::onTransact(uint32_t code, const Parcel& data, Parcel* r
                 return NO_ERROR;
             }
             case 20000: {
-              uint64_t disp = data.readUint64();
-              int mode = data.readInt32();
-              ALOGI("Debug: Set display = %llu, power mode = %d", (unsigned long long)disp, mode);
-              setPowerMode(getPhysicalDisplayToken(disp), mode);
-              return NO_ERROR;
+                uint64_t disp = 0;
+                int32_t mode = HWC_POWER_MODE_NORMAL;
+                int32_t tile_h_loc = -1;
+                int32_t tile_v_loc = -1;
+                uint32_t num_h_tiles = 1;
+                uint32_t num_v_tiles = 1;
+                if (data.readUint64(&disp) != NO_ERROR) {
+                    err = BAD_TYPE;
+                    ALOGE("Invalid 64-bit unsigned-int display id parameter.");
+                    break;
+                }
+                if (data.readInt32(&mode) != NO_ERROR) {
+                    err = BAD_TYPE;
+                    ALOGE("Invalid 32-bit signed-int power mode parameter.");
+                    break;
+                }
+                if (data.readInt32(&tile_h_loc) != NO_ERROR) {
+                    tile_h_loc = -1;
+                }
+                if (data.readInt32(&tile_v_loc) != NO_ERROR) {
+                    tile_v_loc = 0;
+                }
+                if (tile_h_loc < 0) {
+                    ALOGI("Debug: Set display = %llu, power mode = %d", (unsigned long long)disp,
+                          mode);
+                    setPowerMode(getPhysicalDisplayToken(disp), mode);
+                } else {
+#if defined(QTI_DISPLAY_CONFIG_ENABLED) && defined(DISPLAY_CONFIG_TILE_DISPLAY_APIS_1_0)
+                    ::DisplayConfig::PowerMode hwcMode = ::DisplayConfig::PowerMode::kOff;
+                    switch (mode) {
+                        case HWC_POWER_MODE_DOZE:
+                            hwcMode = ::DisplayConfig::PowerMode::kDoze;
+                            break;
+                        case HWC_POWER_MODE_NORMAL:
+                            hwcMode = ::DisplayConfig::PowerMode::kOn;
+                            break;
+                        case HWC_POWER_MODE_DOZE_SUSPEND:
+                            hwcMode = ::DisplayConfig::PowerMode::kDozeSuspend;
+                            break;
+                        default:
+                            break;
+                    }
+                    // A regular display has one h tile and one v tile.
+                    mDisplayConfigIntf->GetDisplayTileCount(disp, &num_h_tiles, &num_v_tiles);
+                    if (((num_h_tiles * num_v_tiles) < 2) || tile_h_loc >= num_h_tiles
+                        || tile_v_loc >= num_v_tiles) {
+                        ALOGE("Debug: Display %llu has only %u h tiles and %u v tiles. Not a true "
+                              "tile display or invalid tile h or v locations given.",
+                              (unsigned long long)disp, num_h_tiles, num_v_tiles);
+                    } else {
+                        err = mDisplayConfigIntf->SetPowerModeTiled(disp, hwcMode, tile_h_loc,
+                                                                    tile_v_loc);
+                        if (NO_ERROR != err) {
+                            ALOGE("Debug: DisplayConfig::SetPowerModeTiled() returned error %d",
+                                  err);
+                            break;
+                        }
+                    }
+#endif
+                    ALOGI("Debug: Set display = %llu, power mode = %d at tile h loc = %d, tile v "
+                          "loc = %d (Has %u h tiles and %u v tiles)", (unsigned long long)disp,
+                          mode, tile_h_loc, tile_v_loc, num_h_tiles, num_v_tiles);
+                }
+                return NO_ERROR;
+            }
+            case 20001: {
+                uint64_t disp = 0;
+                int32_t level = 0;
+                int32_t tile_h_loc = -1;
+                int32_t tile_v_loc = -1;
+                uint32_t num_h_tiles = 1;
+                uint32_t num_v_tiles = 1;
+                if (data.readUint64(&disp) != NO_ERROR) {
+                    err = BAD_TYPE;
+                    ALOGE("Invalid 64-bit unsigned-int display id parameter.");
+                    break;
+                }
+                if (data.readInt32(&level) != NO_ERROR) {
+                    err = BAD_TYPE;
+                    ALOGE("Invalid 32-bit signed-int brightess parameter.");
+                    break;
+                }
+                float levelf = static_cast<float>(level)/255.0f;
+                if (data.readInt32(&tile_h_loc) != NO_ERROR) {
+                    tile_h_loc = -1;
+                }
+                if (data.readInt32(&tile_v_loc) != NO_ERROR) {
+                    tile_v_loc = 0;
+                }
+                if (tile_h_loc < 0) {
+                    ALOGI("Debug: Set display = %llu, brightness level = %d/255 (%0.2ff)",
+                          (unsigned long long)disp, level, levelf);
+                    setDisplayBrightness(getPhysicalDisplayToken(disp), levelf);
+                } else {
+#if defined(QTI_DISPLAY_CONFIG_ENABLED) && defined(DISPLAY_CONFIG_TILE_DISPLAY_APIS_1_0)
+                    // A regular display has one h tile and one v tile.
+                    mDisplayConfigIntf->GetDisplayTileCount(disp, &num_h_tiles, &num_v_tiles);
+                    if (((num_h_tiles * num_v_tiles) < 2) || tile_h_loc >= num_h_tiles
+                        || tile_v_loc >= num_v_tiles) {
+                        ALOGE("Debug: Display %llu has only %u h tiles and %u v tiles. Not a true "
+                              "tile display or invalid tile h or v locations given.",
+                              (unsigned long long)disp, num_h_tiles, num_v_tiles);
+                    } else {
+                        err = mDisplayConfigIntf->SetPanelBrightnessTiled(disp, level, tile_h_loc,
+                                                                          tile_v_loc);
+                        if (NO_ERROR != err) {
+                            ALOGE("Debug: DisplayConfig::SetPanelBrightnessTiled() returned error "
+                                  "%d", err);
+                            break;
+                        }
+                    }
+#endif
+                    ALOGI("Debug: Set display = %llu, brightness level = %d/255 (%0.2ff) at tile h "
+                          "loc = %d, tile v loc = %d (Has %u h tiles and %u v tiles)",
+                          (unsigned long long)disp, level, levelf, tile_h_loc, tile_v_loc,
+                          num_h_tiles, num_v_tiles);
+                }
+                return NO_ERROR;
+            }
+            case 20002: {
+                uint64_t disp = 0;
+                int32_t pref = 0;
+                if (data.readUint64(&disp) != NO_ERROR) {
+                    err = BAD_TYPE;
+                    ALOGE("Invalid 64-bit unsigned-int display id parameter.");
+                    break;
+                }
+                if (data.readInt32(&pref) != NO_ERROR) {
+                    err = BAD_TYPE;
+                    ALOGE("Invalid 32-bit signed-int wider-mode preference parameter.");
+                    break;
+                }
+                ALOGI("Debug: Set display = %llu, wider-mode preference = %d",
+                      (unsigned long long)disp, pref);
+#if defined(QTI_DISPLAY_CONFIG_ENABLED) && defined(DISPLAY_CONFIG_TILE_DISPLAY_APIS_1_0)
+                ::DisplayConfig::WiderModePref wider_mode_pref =
+                    ::DisplayConfig::WiderModePref::kNoPreference;
+                switch (pref) {
+                    case 1:
+                        wider_mode_pref = ::DisplayConfig::WiderModePref::kWiderAsyncMode;
+                        break;
+                    case 2:
+                        wider_mode_pref = ::DisplayConfig::WiderModePref::kWiderSyncMode;
+                        break;
+                    default:
+                        // Use default DisplayConfig::WiderModePref::kNoPreference.
+                        break;
+                }
+                err = mDisplayConfigIntf->SetWiderModePreference(disp, wider_mode_pref);
+                if (NO_ERROR != err) {
+                    ALOGE("Debug: DisplayConfig::SetWiderModePreference() returned error %d", err);
+                    break;
+                }
+#endif
+                return NO_ERROR;
             }
         }
     }
@@ -7328,6 +7479,11 @@ status_t SurfaceFlinger::setFrameRate(const sp<IGraphicBufferProducer>& surface,
         Mutex::Autolock lock(mStateLock);
         if (authenticateSurfaceTextureLocked(surface)) {
             sp<Layer> layer = (static_cast<MonitoredProducer*>(surface.get()))->getLayer();
+            if (layer == nullptr) {
+                ALOGE("Attempt to set frame rate on a layer that no longer exists");
+                return BAD_VALUE;
+            }
+
             if (layer->setFrameRate(
                         Layer::FrameRate(frameRate,
                                          Layer::FrameRate::convertCompatibility(compatibility)))) {
