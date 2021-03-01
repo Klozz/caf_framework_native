@@ -1483,6 +1483,13 @@ Layer::FrameRate Layer::getFrameRateForLayerTree() const {
 
 void Layer::deferTransactionUntil_legacy(const sp<Layer>& barrierLayer, uint64_t frameNumber) {
     ATRACE_CALL();
+    if (mLayerDetached) {
+        // If the layer is detached, then we don't defer this transaction since we will not
+        // commit the pending state while the layer is detached. Adding sync points may cause
+        // the barrier layer to wait for the states to be committed before dequeuing a buffer.
+        return;
+    }
+
     mCurrentState.barrierLayer_legacy = barrierLayer;
     mCurrentState.frameNumber_legacy = frameNumber;
     // We don't set eTransactionNeeded, because just receiving a deferral
@@ -1542,7 +1549,13 @@ uint32_t Layer::getEffectiveUsage(uint32_t usage) const {
           ::DisplayConfig::ClientInterface::Create("SurfaceFlinger::Layer" + std::to_string(0),
               nullptr, &DisplayConfigIntf);
           if (DisplayConfigIntf) {
-              DisplayConfigIntf->IsRCSupported(0, &rc_supported);
+              std::string value = "0";
+              std::string rc_prop = "enable_rc_support";
+              int ret = DisplayConfigIntf->GetDebugProperty(rc_prop, &value);
+              ALOGI("enable_rc_support, ret:%d value:%s", ret, value.c_str());
+              if (!ret && (value == "1")) {
+                  DisplayConfigIntf->IsRCSupported(0, &rc_supported);
+              }
               ::DisplayConfig::ClientInterface::Destroy(DisplayConfigIntf);
           }
           ALOGI("Mask layers are %sCPU-readable.", rc_supported ? "" : "*NOT* ");
@@ -2467,7 +2480,15 @@ InputWindowInfo Layer::fillInputInfo() {
     xSurfaceInset = (xSurfaceInset >= 0) ? std::min(xSurfaceInset, layerBounds.getWidth() / 2) : 0;
     ySurfaceInset = (ySurfaceInset >= 0) ? std::min(ySurfaceInset, layerBounds.getHeight() / 2) : 0;
 
-    layerBounds.inset(xSurfaceInset, ySurfaceInset, xSurfaceInset, ySurfaceInset);
+    // inset while protecting from overflow TODO(b/161235021): What is going wrong
+    // in the overflow scenario?
+    {
+    int32_t tmp;
+    if (!__builtin_add_overflow(layerBounds.left, xSurfaceInset, &tmp)) layerBounds.left = tmp;
+    if (!__builtin_sub_overflow(layerBounds.right, xSurfaceInset, &tmp)) layerBounds.right = tmp;
+    if (!__builtin_add_overflow(layerBounds.top, ySurfaceInset, &tmp)) layerBounds.top = tmp;
+    if (!__builtin_sub_overflow(layerBounds.bottom, ySurfaceInset, &tmp)) layerBounds.bottom = tmp;
+    }
 
     // Input coordinate should match the layer bounds.
     info.frameLeft = layerBounds.left;
