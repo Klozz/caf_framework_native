@@ -92,6 +92,7 @@ class ComposerExtnLib;
 class FrameExtnIntf;
 class LayerExtnIntf;
 class FrameSchedulerIntf;
+class DisplayExtnIntf;
 } // namespace composer
 
 using composer::FrameExtnIntf;
@@ -193,6 +194,7 @@ public:
 
     static std::unique_ptr<LayerExtWrapper> Create();
     int getLayerClass(const std::string &name);
+    void updateLayerState(const std::vector<std::string>&layers, int numLayers);
 
     LayerExtWrapper(const LayerExtWrapper&) = delete;
     LayerExtWrapper& operator=(const LayerExtWrapper&) = delete;
@@ -1307,6 +1309,7 @@ public:
 private:
     composer::ComposerExtnIntf *mComposerExtnIntf = nullptr;
     composer::FrameSchedulerIntf *mFrameSchedulerExtnIntf = nullptr;
+    composer::DisplayExtnIntf *mDisplayExtnIntf = nullptr;
 
     bool mDolphinFuncsEnabled = false;
     void *mDolphinHandle = nullptr;
@@ -1330,6 +1333,7 @@ private:
     bool (*mDestroyFrameExtnFunc)(FrameExtnIntf *interface) = nullptr;
 
     bool mUseLayerExt = false;
+    bool mSplitLayerExt = false;
     std::unique_ptr<LayerExtWrapper> mLayerExt;
 };
 

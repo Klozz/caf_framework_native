@@ -331,6 +331,10 @@ int LayerExtWrapper::getLayerClass(const std::string &name) {
   return mInst->GetLayerClass(name);
 }
 
+void LayerExtWrapper::updateLayerState(const std::vector<std::string>&layers, int numLayers) {
+    mInst->UpdateLayerState(layers, numLayers);
+}
+
 LayerExtWrapper::~LayerExtWrapper() {
     if (mInst) {
         mLayerExtDestroyFunc(mInst);
@@ -498,6 +502,12 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
     int_value = atoi(value);
     if (int_value) {
         mUseLayerExt = true;
+    }
+
+    property_get("vendor.display.split_layer_ext", value, "0");
+    int_value = atoi(value);
+    if (int_value) {
+        mSplitLayerExt = true;
     }
 
     property_get("vendor.display.use_smooth_motion", value, "0");
@@ -918,7 +928,7 @@ void SurfaceFlinger::init() {
                                         mPhaseOffsets->getOffsetThresholdForNextVsync());
     }
 
-    if (mUseLayerExt) {
+    if (mUseLayerExt || mSplitLayerExt) {
         mLayerExt = LayerExtWrapper::Create();
         if (!mLayerExt) {
             ALOGE("Failed to create layer extension");
@@ -927,11 +937,16 @@ void SurfaceFlinger::init() {
 
     mComposerExtnIntf = composer::ComposerExtnLib::GetInstance();
     if (!mComposerExtnIntf) {
-        ALOGE("Failed to create composer extension");
+        ALOGE("Unable to get composer extension");
     } else {
         int ret = mComposerExtnIntf->CreateFrameScheduler(&mFrameSchedulerExtnIntf);
-        if (ret == -1 || !mFrameSchedulerExtnIntf) {
-            ALOGI("Failed to create frame scheduler extension");
+        if (ret) {
+            ALOGI("Unable to create frame scheduler extension");
+        }
+
+        ret = mComposerExtnIntf->CreateDisplayExtn(&mDisplayExtnIntf);
+        if (ret) {
+            ALOGI("Unable to create display extension");
         }
     }
 
@@ -1217,6 +1232,11 @@ void SurfaceFlinger::setDesiredActiveConfig(const ActiveConfigInfo& info) {
     if (mRefreshRateOverlay) {
         mRefreshRateOverlay->changeRefreshRate(mDesiredActiveConfig.type);
     }
+
+    if (mDisplayExtnIntf && !mCheckPendingFence) {
+      const auto& refreshRate = mRefreshRateConfigs.getRefreshRate(mDesiredActiveConfig.configId);
+      mDisplayExtnIntf->SetContentFps(refreshRate->fps);
+    }
 }
 
 status_t SurfaceFlinger::setActiveConfig(const sp<IBinder>& displayToken, int mode) {
@@ -1229,7 +1249,7 @@ status_t SurfaceFlinger::setActiveConfig(const sp<IBinder>& displayToken, int mo
     // RefreshRateConfigs are only supported on Primary display.
     if (display && display->isPrimary()) {
         mRefreshRateConfigs.setActiveConfig(mode);
-        mRefreshRateConfigs.populate(getHwComposer().getConfigs(*display->getId()));
+        mRefreshRateConfigs.repopulate(getHwComposer().getConfigs(*display->getId()));
     }
 
     return setAllowedDisplayConfigs(displayToken, allowedConfig);
@@ -1475,7 +1495,7 @@ status_t SurfaceFlinger::setDisplayContentSamplingEnabled(const sp<IBinder>& dis
 }
 
 status_t SurfaceFlinger::setDisplayElapseTime(const sp<DisplayDevice>& display) const {
-    if (!mUseAdvanceSfOffset && mPhaseOffsets->getCurrentSfOffset() >= 0) {
+    if (!mUseAdvanceSfOffset || mPhaseOffsets->getCurrentSfOffset() >= 0) {
         return OK;
     }
 
@@ -4173,11 +4193,13 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<DisplayDevice>& displayDevice,
     ALOGV("Rendering client layers");
     bool firstLayer = true;
     Region clearRegion = Region::INVALID_REGION;
+    std::vector<std::string> layers;
     for (auto& layer : displayDevice->getVisibleLayersSortedByZ()) {
         const Region viewportRegion(displayState.viewport);
         const Region clip(viewportRegion.intersect(layer->visibleRegion));
         ALOGV("Layer: %s", layer->getName().string());
         ALOGV("  Composition type: %s", toString(layer->getCompositionType(displayDevice)).c_str());
+        layers.push_back(layer->getName().string());
         if (!clip.isEmpty()) {
             switch (layer->getCompositionType(displayDevice)) {
                 case Hwc2::IComposerClient::Composition::CURSOR:
@@ -4230,6 +4252,10 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<DisplayDevice>& displayDevice,
             ALOGV("  Skipping for empty clip");
         }
         firstLayer = false;
+    }
+
+    if (mSplitLayerExt && mLayerExt) {
+        mLayerExt->updateLayerState(layers, mNumLayers);
     }
 
     // Perform some cleanup steps if we used client composition.
@@ -5273,8 +5299,9 @@ void SurfaceFlinger::setPowerModeInternal(const sp<DisplayDevice>& display, int 
                 mScheduler->onScreenAcquired(mAppConnectionHandle);
                 mScheduler->resyncToHardwareVsync(true, getVsyncPeriod());
             }
-        } else if ((mPluggableVsyncPrioritized && (displayId != getInternalDisplayIdLocked())) ||
-                    displayId == getInternalDisplayIdLocked()) {
+        } else if ((mPluggableVsyncPrioritized && !display->getIsDisplayBuiltInType()) ||
+                   (displayId == getInternalDisplayIdLocked()) ||
+                   display->getIsDisplayBuiltInType()) {
             updateVsyncSource();
         }
 
@@ -6730,7 +6757,7 @@ status_t SurfaceFlinger::onTransact(uint32_t code, const Parcel& data, Parcel* r
                     // RefreshRateConfigs are only supported on Primary display.
                     if (display && display->isPrimary()) {
                         mRefreshRateConfigs.setActiveConfig(n);
-                        mRefreshRateConfigs.populate(getHwComposer().getConfigs(*display->getId()));
+                        mRefreshRateConfigs.repopulate(getHwComposer().getConfigs(*display->getId()));
                     }
                     status_t result = setAllowedDisplayConfigs(displayToken, {n});
                     if (result != NO_ERROR) {
