@@ -179,7 +179,6 @@ void Layer::onLayerDisplayed(const sp<Fence>& /*releaseFence*/) {}
 
 void Layer::onRemovedFromCurrentState() {
     // the layer is removed from SF mCurrentState to mLayersPendingRemoval
-
     mPendingRemoval = true;
 
     if (mCurrentState.zOrderRelativeOf != nullptr) {
@@ -221,6 +220,11 @@ bool Layer::getPremultipledAlpha() const {
 
 sp<IBinder> Layer::getHandle() {
     Mutex::Autolock _l(mLock);
+    if (mGetHandleCalled) {
+        ALOGE("Get handle called twice" );
+        return nullptr;
+    }
+    mGetHandleCalled = true;
     return new Handle(mFlinger, this);
 }
 
@@ -1420,7 +1424,7 @@ LayerDebugInfo Layer::getLayerDebugInfo() const {
     LayerDebugInfo info;
     const Layer::State& ds = getDrawingState();
     info.mName = getName();
-    sp<Layer> parent = getParent();
+    sp<Layer> parent = mDrawingParent.promote();
     info.mParentName = (parent == nullptr ? std::string("none") : parent->getName().string());
     info.mType = String8(getTypeId());
     info.mTransparentRegion = ds.activeTransparentRegion;
