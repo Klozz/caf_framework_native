@@ -34,8 +34,15 @@ sp<Looper> getLooper() {
         sp<Looper> looper = new Looper(false /* allowNonCallbacks */);
 
         std::thread{[&](){
-            int pollResult = looper->pollAll(-1 /* timeout */);
-            LOG(ERROR) << "Looper::pollAll returns unexpected " << pollResult;
+            int pollResult = 0;
+            do {
+                pollResult = looper->pollAll(-1 /* timeout */);
+                if (pollResult == Looper::POLL_WAKE) {
+                    LOG(WARNING) << "Looper::pollAll is interrupted, try poll again. ";
+                } else {
+                    LOG(ERROR) << "Looper::pollAll returns unexpected " << pollResult;
+                }
+            } while (pollResult == Looper::POLL_WAKE);
         }}.detach();
 
         return looper;
@@ -61,11 +68,15 @@ DisplayEventReceiver::AttachedEvent::~AttachedEvent() {
 }
 
 bool DisplayEventReceiver::AttachedEvent::detach() {
+    bool result = false;
     if (!valid()) {
         return true;
     }
-
-    return getLooper()->removeFd(mFwkReceiver.getFd());
+    result = getLooper()->removeFd(mFwkReceiver.getFd());
+    if (result) {
+        mLooperAttached = false;
+    }
+    return result;
 }
 
 bool DisplayEventReceiver::AttachedEvent::valid() const {
