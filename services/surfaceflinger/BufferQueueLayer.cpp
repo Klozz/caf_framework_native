@@ -280,10 +280,14 @@ status_t BufferQueueLayer::updateTexImage(bool& recomputeVisibleRegions, nsecs_t
         // and return early
         if (queuedBuffer) {
             Mutex::Autolock lock(mQueueItemLock);
-            mConsumer->mergeSurfaceDamage(mQueueItems[0].mSurfaceDamage);
-            mFlinger->mTimeStats->removeTimeRecord(layerId, mQueueItems[0].mFrameNumber);
-            mQueueItems.removeAt(0);
-            mQueuedFrames--;
+            if (mQueuedFrames > 0) {
+              mConsumer->mergeSurfaceDamage(mQueueItems[0].mSurfaceDamage);
+              mFlinger->mTimeStats->removeTimeRecord(layerId, mQueueItems[0].mFrameNumber);
+              mQueueItems.removeAt(0);
+              mQueuedFrames--;
+            } else {
+                ALOGE("mQueuedFrames <= 0 or mQueueItems.size() = %zu\n", mQueueItems.size());
+            }
         }
         return BAD_VALUE;
     } else if (updateResult != NO_ERROR || mUpdateTexImageFailed) {
@@ -308,6 +312,7 @@ status_t BufferQueueLayer::updateTexImage(bool& recomputeVisibleRegions, nsecs_t
         return BAD_VALUE;
     }
 
+    bool more_frames_pending = false;
     if (queuedBuffer) {
         // Autolock scope
         auto currentFrameNumber = mConsumer->getFrameNumber();
@@ -316,24 +321,29 @@ status_t BufferQueueLayer::updateTexImage(bool& recomputeVisibleRegions, nsecs_t
 
         // Remove any stale buffers that have been dropped during
         // updateTexImage
-        while (mQueueItems[0].mFrameNumber != currentFrameNumber) {
+        while (mQueuedFrames > 0 && mQueueItems[0].mFrameNumber != currentFrameNumber) {
             mConsumer->mergeSurfaceDamage(mQueueItems[0].mSurfaceDamage);
             mFlinger->mTimeStats->removeTimeRecord(layerId, mQueueItems[0].mFrameNumber);
             mQueueItems.removeAt(0);
             mQueuedFrames--;
         }
 
-        uint64_t bufferID = mQueueItems[0].mGraphicBuffer->getId();
-        mFlinger->mTimeStats->setLatchTime(layerId, currentFrameNumber, latchTime);
-        mFlinger->mFrameTracer->traceTimestamp(layerId, bufferID, currentFrameNumber, latchTime,
-                                               FrameTracer::FrameEvent::LATCH);
+        if (mQueuedFrames > 0) {
+          uint64_t bufferID = mQueueItems[0].mGraphicBuffer->getId();
+          mFlinger->mTimeStats->setLatchTime(layerId, currentFrameNumber, latchTime);
+          mFlinger->mFrameTracer->traceTimestamp(layerId, bufferID, currentFrameNumber, latchTime,
+                                                 FrameTracer::FrameEvent::LATCH);
 
-        mQueueItems.removeAt(0);
+          mQueueItems.removeAt(0);
+          more_frames_pending = (mQueuedFrames.fetch_sub(1) > 1);
+        } else {
+                ALOGE("mQueuedFrames <= 0 or mQueueItems.size() = %zu\n", mQueueItems.size());
+        }
     }
 
     // Decrement the queued-frames count.  Signal another event if we
     // have more frames pending.
-    if ((queuedBuffer && mQueuedFrames.fetch_sub(1) > 1) || mAutoRefresh) {
+    if ((queuedBuffer && more_frames_pending) || mAutoRefresh) {
         mFlinger->signalLayerUpdate();
     }
 
