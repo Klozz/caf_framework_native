@@ -489,6 +489,8 @@ void EventThread::dispatchEvent(const DisplayEventReceiver::Event& event,
                     break;
 
                 case -EAGAIN:
+                    ALOGW("Failed dispatching %s for %s. attempt %d", toString(event).c_str(),
+                          toString(*consumer).c_str(), attempt+1);
                     needs_retry = true;
                     break;
 
