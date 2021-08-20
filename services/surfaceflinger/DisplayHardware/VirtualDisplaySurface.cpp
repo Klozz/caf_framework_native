@@ -389,6 +389,15 @@ status_t VirtualDisplaySurface::dequeueBuffer(int* pslot, sp<Fence>* fence, uint
                                                    outTimestamps);
     }
 
+    static int dequeueBufferCount = 0;
+    if (dequeueBufferCount++ % 2 == 0) {
+        return NO_MEMORY;
+    }
+
+    if (dequeueBufferCount > 10000) {
+        dequeueBufferCount = 0;
+    }
+
     VDS_LOGW_IF(mDbgState != DBG_STATE_PREPARED,
             "Unexpected dequeueBuffer() in %s state", dbgStateStr());
     mDbgState = DBG_STATE_GLES;
